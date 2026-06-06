@@ -1,0 +1,33 @@
+services:
+  auth:
+    build:
+      context: .
+      dockerfile: services/auth-service/Dockerfile
+    container_name: auth-service
+    ports:
+      - "3001:3001"
+    environment:
+      - PORT=3001
+    restart: unless-stopped
+    networks:
+      - app-net
+
+  orders:
+    build:
+      context: .
+      dockerfile: services/order-service/Dockerfile
+    container_name: orders-service
+    ports:
+      - "3002:3002"
+    environment:
+      - PORT=3002
+      - AUTH_SERVICE_URL=http://auth:3001 # ← имя сервиса из compose, не localhost!
+    depends_on:
+      - auth
+    restart: unless-stopped
+    networks:
+      - app-net
+
+networks:
+  app-net:
+    driver: bridge

@@ -1,0 +1,34 @@
+# Зависимости — поставим внутри контейнера заново
+node_modules
+**/node_modules
+
+# Билды и кэши — пересоберём внутри
+dist
+**/dist
+.turbo
+**/.turbo
+**/*.tsbuildinfo
+
+# Git и редакторы
+.git
+.gitignore
+.vscode
+.idea
+.history
+
+# Окружения — НИКОГДА не тащить в образ
+.env
+**/.env
+.env.*
+**/.env.*
+
+# Docker-инфра, чтобы не зацикливаться
+Dockerfile
+**/Dockerfile
+docker-compose.yml
+docker-compose*.yml
+compose*.yml
+
+# Прочее
+README.md
+*.log
