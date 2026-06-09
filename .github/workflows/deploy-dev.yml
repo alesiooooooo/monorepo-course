@@ -1,0 +1,202 @@
+name: Deploy Dev EC2
+
+on:
+  push:
+    branches:
+      - master
+
+concurrency:
+  group: monorepo-course-dev-deploy
+  cancel-in-progress: false
+
+jobs:
+  start-runner:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      label: ${{ steps.start.outputs.label }}
+      ec2_instance_id: ${{ steps.start.outputs.ec2-instance-id }}
+      services_ec2_instance_id: ${{ steps.resolve.outputs.services_ec2_instance_id }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - id: resolve
+        name: Resolve infrastructure outputs
+        run: |
+          set -euo pipefail
+
+          STACK_NAME="services-dev"
+          RUNNER_AMI_PARAMETER="/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
+
+          runner_subnet_id=$(
+            aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+              --query "Stacks[0].Outputs[?OutputKey=='RunnerSubnetId'].OutputValue" \
+              --output text
+          )
+          runner_security_group_id=$(
+            aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+              --query "Stacks[0].Outputs[?OutputKey=='RunnerSecurityGroupId'].OutputValue" \
+              --output text
+          )
+          runner_instance_profile_name=$(
+            aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+              --query "Stacks[0].Outputs[?OutputKey=='RunnerInstanceProfileName'].OutputValue" \
+              --output text
+          )
+          services_ec2_instance_id=$(
+            aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+              --query "Stacks[0].Outputs[?OutputKey=='ServicesEc2InstanceId'].OutputValue" \
+              --output text
+          )
+          runner_ami_id=$(
+            aws ssm get-parameter \
+              --name "$RUNNER_AMI_PARAMETER" \
+              --query "Parameter.Value" \
+              --output text
+          )
+
+          echo "runner_subnet_id=${runner_subnet_id}" >> "$GITHUB_OUTPUT"
+          echo "runner_security_group_id=${runner_security_group_id}" >> "$GITHUB_OUTPUT"
+          echo "runner_instance_profile_name=${runner_instance_profile_name}" >> "$GITHUB_OUTPUT"
+          echo "services_ec2_instance_id=${services_ec2_instance_id}" >> "$GITHUB_OUTPUT"
+          echo "runner_ami_id=${runner_ami_id}" >> "$GITHUB_OUTPUT"
+
+      - id: start
+        uses: machulav/ec2-github-runner@v2
+        with:
+          mode: start
+          github-token: ${{ secrets.GH_PAT }}
+          ec2-image-id: ${{ steps.resolve.outputs.runner_ami_id }}
+          ec2-instance-type: t3.medium
+          subnet-id: ${{ steps.resolve.outputs.runner_subnet_id }}
+          security-group-id: ${{ steps.resolve.outputs.runner_security_group_id }}
+          iam-role-name: ${{ steps.resolve.outputs.runner_instance_profile_name }}
+          startup-timeout-minutes: 20
+          runner-debug: true
+          pre-runner-script: |
+            set -euo pipefail
+            dnf update -y
+            dnf install -y git jq awscli
+          aws-resource-tags: >
+            [{"Key":"Name","Value":"monorepo-course-runner-${{ github.run_id }}"},
+             {"Key":"Project","Value":"monorepo-course"},
+             {"Key":"Environment","Value":"learn-aws-dev"},
+             {"Key":"WorkflowRun","Value":"${{ github.run_id }}"}]
+
+  deploy:
+    needs: start-runner
+    runs-on: ${{ needs.start-runner.outputs.label }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Roll out on dev EC2 via SSM
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          TARGET_INSTANCE_ID: ${{ needs.start-runner.outputs.services_ec2_instance_id }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+
+          command_id=$(aws ssm send-command \
+            --region "${AWS_REGION}" \
+            --document-name "AWS-RunShellScript" \
+            --comment "monorepo-course deploy ${GITHUB_SHA}" \
+            --timeout-seconds 7200 \
+            --instance-ids "${TARGET_INSTANCE_ID}" \
+            --parameters "commands=$(jq -cn --arg repo "${GITHUB_REPOSITORY}" --arg sha "${GITHUB_SHA}" --arg pat "${GH_PAT}" '[
+              \"set -euo pipefail\",
+              \"sudo mkdir -p /opt/apps\",
+              \"sudo chown -R ec2-user:ec2-user /opt/apps\",
+              \"git config --system --add safe.directory /opt/apps/monorepo-course\",
+              \"if [ ! -d /opt/apps/monorepo-course/.git ]; then rm -rf /opt/apps/monorepo-course; git clone --depth 1 --branch master https://x-access-token:\($pat)@github.com/\($repo).git /opt/apps/monorepo-course; fi\",
+              \"cd /opt/apps/monorepo-course\",
+              \"git remote set-url origin https://x-access-token:\($pat)@github.com/\($repo).git\",
+              \"git fetch --depth 1 origin \($sha)\",
+              \"git checkout --force \($sha)\",
+              \"sudo -u ec2-user bash -lc \\\"cd /opt/apps/monorepo-course && npm install && npm run build && bash deploy/scripts/sync-env.sh /opt/apps/monorepo-course/deploy learn-aws-dev && bash deploy/scripts/render-env.sh /opt/apps/monorepo-course/deploy && bash deploy/scripts/run-migrations.sh /opt/apps/monorepo-course/deploy learn-aws-dev && pm2 startOrReload deploy/ecosystem.config.js --update-env && pm2 restart auth-service orders-service payments-service --update-env && pm2 save\\\"\",
+              \"curl --fail --silent --show-error http://127.0.0.1:3001/login >/dev/null\",
+              \"curl --fail --silent --show-error -X POST http://127.0.0.1:3002/orders -H \\\"Content-Type: application/json\\\" -d \\\"{}\\\" >/dev/null\",
+              \"curl --fail --silent --show-error http://127.0.0.1:3003/pay >/dev/null\"
+            ]')" \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM command id: ${command_id}"
+
+          status="Pending"
+          max_wait_seconds=3600
+          poll_interval_seconds=15
+          waited_seconds=0
+          while [ "${waited_seconds}" -lt "${max_wait_seconds}" ]; do
+            status=$(aws ssm get-command-invocation \
+              --region "${AWS_REGION}" \
+              --command-id "${command_id}" \
+              --instance-id "${TARGET_INSTANCE_ID}" \
+              --query "Status" \
+              --output text 2>/dev/null || echo "Pending")
+            echo "SSM status: ${status} (elapsed ${waited_seconds}s)"
+            case "${status}" in
+              Success|Cancelled|TimedOut|Failed|Cancelling)
+                break
+                ;;
+            esac
+            sleep "${poll_interval_seconds}"
+            waited_seconds=$((waited_seconds + poll_interval_seconds))
+          done
+
+          echo "SSM status: ${status}"
+          aws ssm get-command-invocation \
+            --region "${AWS_REGION}" \
+            --command-id "${command_id}" \
+            --instance-id "${TARGET_INSTANCE_ID}" \
+            --query "StandardOutputContent" \
+            --output text || true
+          aws ssm get-command-invocation \
+            --region "${AWS_REGION}" \
+            --command-id "${command_id}" \
+            --instance-id "${TARGET_INSTANCE_ID}" \
+            --query "StandardErrorContent" \
+            --output text || true
+
+          if [ "${status}" != "Success" ]; then
+            echo "SSM rollout failed with status ${status}" >&2
+            exit 1
+          fi
+
+  stop-runner:
+    needs: [start-runner, deploy]
+    runs-on: ubuntu-latest
+    if: ${{ always() && needs.start-runner.outputs.ec2_instance_id != '' }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: machulav/ec2-github-runner@v2
+        with:
+          mode: stop
+          github-token: ${{ secrets.GH_PAT }}
+          label: ${{ needs.start-runner.outputs.label }}
+          ec2-instance-id: ${{ needs.start-runner.outputs.ec2_instance_id }}
