@@ -75,31 +75,35 @@ jobs:
             CLONE_URL="$REPO_URL"
           fi
 
-          cat > /tmp/ssm-commands.json <<EOF
-          {
-            "commands": [
-              "set -euo pipefail",
-              "mkdir -p /opt/apps",
-              "if [ ! -d '$APP_DIR/.git' ]; then rm -rf '$APP_DIR' && git clone '$CLONE_URL' '$APP_DIR'; fi",
-              "cd '$APP_DIR'",
-              "git remote set-url origin '$CLONE_URL'",
-              "git fetch --prune origin",
-              "git reset --hard '$GITHUB_SHA'",
-              "chown -R ec2-user:ec2-user '$APP_DIR'",
-              "runuser -l ec2-user -c 'cd $APP_DIR && npm install'",
-              "runuser -l ec2-user -c 'cd $APP_DIR && npm run build'",
-              "runuser -l ec2-user -c 'cd $APP_DIR && AWS_REGION=$AWS_REGION bash deploy/scripts/sync-env.sh $APP_DIR/deploy $TARGET_ENV'",
-              "runuser -l ec2-user -c 'cd $APP_DIR && bash deploy/scripts/render-env.sh $APP_DIR/deploy'",
-              "runuser -l ec2-user -c 'cd $APP_DIR && bash deploy/scripts/run-migrations.sh $APP_DIR/deploy $TARGET_ENV'",
-              "runuser -l ec2-user -c 'cd $APP_DIR && pm2 startOrReload deploy/ecosystem.config.js --update-env'",
-              "runuser -l ec2-user -c 'pm2 restart auth-service orders-service payments-service --update-env'",
-              "runuser -l ec2-user -c 'pm2 save'",
-              "curl --fail --silent http://127.0.0.1:3001/login >/dev/null",
-              "curl --fail --silent -X POST http://127.0.0.1:3002/orders -H \\\"Content-Type: application/json\\\" -d \\\"{}\\\" >/dev/null",
-              "curl --fail --silent http://127.0.0.1:3003/pay >/dev/null"
-            ]
-          }
-          EOF
+          jq -n \
+            --arg app_dir "$APP_DIR" \
+            --arg clone_url "$CLONE_URL" \
+            --arg github_sha "$GITHUB_SHA" \
+            --arg aws_region "$AWS_REGION" \
+            --arg target_env "$TARGET_ENV" \
+            '{
+              commands: [
+                "set -euo pipefail",
+                "mkdir -p /opt/apps",
+                ("if [ ! -d \u0027" + $app_dir + "/.git\u0027 ]; then rm -rf \u0027" + $app_dir + "\u0027 && git clone \u0027" + $clone_url + "\u0027 \u0027" + $app_dir + "\u0027; fi"),
+                ("cd \u0027" + $app_dir + "\u0027"),
+                ("git remote set-url origin \u0027" + $clone_url + "\u0027"),
+                "git fetch --prune origin",
+                ("git reset --hard \u0027" + $github_sha + "\u0027"),
+                ("chown -R ec2-user:ec2-user \u0027" + $app_dir + "\u0027"),
+                ("runuser -l ec2-user -c \u0027cd " + $app_dir + " && npm install\u0027"),
+                ("runuser -l ec2-user -c \u0027cd " + $app_dir + " && npm run build\u0027"),
+                ("runuser -l ec2-user -c \u0027cd " + $app_dir + " && AWS_REGION=" + $aws_region + " bash deploy/scripts/sync-env.sh " + $app_dir + "/deploy " + $target_env + "\u0027"),
+                ("runuser -l ec2-user -c \u0027cd " + $app_dir + " && bash deploy/scripts/render-env.sh " + $app_dir + "/deploy\u0027"),
+                ("runuser -l ec2-user -c \u0027cd " + $app_dir + " && bash deploy/scripts/run-migrations.sh " + $app_dir + "/deploy " + $target_env + "\u0027"),
+                ("runuser -l ec2-user -c \u0027cd " + $app_dir + " && pm2 startOrReload deploy/ecosystem.config.js --update-env\u0027"),
+                "runuser -l ec2-user -c \u0027pm2 restart auth-service orders-service payments-service --update-env\u0027",
+                "runuser -l ec2-user -c \u0027pm2 save\u0027",
+                "curl --fail --silent http://127.0.0.1:3001/login >/dev/null",
+                "curl --fail --silent -X POST http://127.0.0.1:3002/orders -H \u0027Content-Type: application/json\u0027 -d \u0027{}\u0027 >/dev/null",
+                "curl --fail --silent http://127.0.0.1:3003/pay >/dev/null"
+              ]
+            }' > /tmp/ssm-commands.json
 
           COMMAND_ID="$(
             aws ssm send-command \
