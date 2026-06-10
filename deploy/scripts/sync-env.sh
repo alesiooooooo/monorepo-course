@@ -1,30 +1,46 @@
 #!/usr/bin/env bash
+
 set -euo pipefail
 
-ROOT_DIR="${1:-$(pwd)}"
-ENVIRONMENT="${2:-learn-aws-dev}"
-PREFIX="/monorepo-course/${ENVIRONMENT}"
-AWS_REGION="${AWS_REGION:-eu-central-1}"
+DEPLOY_DIR="${1:?deploy dir is required}"
+TARGET_ENV="${2:?target env is required}"
+AWS_REGION="${AWS_REGION:?AWS_REGION is required}"
 
-write_service_env() {
+mkdir -p "$DEPLOY_DIR"
+
+sync_service() {
   local service="$1"
-  local target_file="$2"
-  local path="${PREFIX}/${service}/"
+  local output_file="$2"
+  local path="/monorepo-course/${TARGET_ENV}/${service}/"
+  local tmp_file
+
+  tmp_file="$(mktemp)"
 
   aws ssm get-parameters-by-path \
-    --region "${AWS_REGION}" \
-    --path "${path}" \
-    --recursive \
+    --region "$AWS_REGION" \
+    --path "$path" \
     --with-decryption \
-    --output json \
-    --query 'Parameters[].{Name:Name,Value:Value}' \
-    | jq -r '.[] | "\(.Name | split("/")[-1])=\(.Value)"' > "${target_file}"
+    --recursive \
+    --query 'Parameters[*].[Name,Value]' \
+    --output text > "$tmp_file"
 
-  chmod 600 "${target_file}"
-  echo "Synced ${target_file}"
+  if [ ! -s "$tmp_file" ]; then
+    echo "No SSM parameters found for $path" >&2
+    rm -f "$tmp_file"
+    exit 1
+  fi
+
+  awk '{
+    n = split($1, parts, "/");
+    key = parts[n];
+    $1 = "";
+    sub(/^\t/, "", $0);
+    printf("%s=%s\n", key, $0);
+  }' "$tmp_file" | sort > "$output_file"
+
+  rm -f "$tmp_file"
 }
 
-mkdir -p "${ROOT_DIR}"
-write_service_env "auth" "${ROOT_DIR}/.env.auth"
-write_service_env "orders" "${ROOT_DIR}/.env.orders"
-write_service_env "payments" "${ROOT_DIR}/.env.payments"
+sync_service "auth" "$DEPLOY_DIR/.env.auth"
+sync_service "orders" "$DEPLOY_DIR/.env.orders"
+sync_service "payments" "$DEPLOY_DIR/.env.payments"

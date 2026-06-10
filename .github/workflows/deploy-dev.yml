@@ -1,4 +1,4 @@
-name: Deploy Dev EC2
+name: Deploy Dev
 
 on:
   push:
@@ -9,194 +9,159 @@ concurrency:
   group: monorepo-course-dev-deploy
   cancel-in-progress: false
 
+permissions:
+  contents: read
+  id-token: write
+
 jobs:
-  start-runner:
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: read
-    outputs:
-      label: ${{ steps.start.outputs.label }}
-      ec2_instance_id: ${{ steps.start.outputs.ec2-instance-id }}
-      services_ec2_instance_id: ${{ steps.resolve.outputs.services_ec2_instance_id }}
-    steps:
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
-
-      - id: resolve
-        name: Resolve infrastructure outputs
-        run: |
-          set -euo pipefail
-
-          STACK_NAME="services-dev"
-          RUNNER_AMI_PARAMETER="/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
-
-          runner_subnet_id=$(
-            aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
-              --query "Stacks[0].Outputs[?OutputKey=='RunnerSubnetId'].OutputValue" \
-              --output text
-          )
-          runner_security_group_id=$(
-            aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
-              --query "Stacks[0].Outputs[?OutputKey=='RunnerSecurityGroupId'].OutputValue" \
-              --output text
-          )
-          runner_instance_profile_name=$(
-            aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
-              --query "Stacks[0].Outputs[?OutputKey=='RunnerInstanceProfileName'].OutputValue" \
-              --output text
-          )
-          services_ec2_instance_id=$(
-            aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
-              --query "Stacks[0].Outputs[?OutputKey=='ServicesEc2InstanceId'].OutputValue" \
-              --output text
-          )
-          runner_ami_id=$(
-            aws ssm get-parameter \
-              --name "$RUNNER_AMI_PARAMETER" \
-              --query "Parameter.Value" \
-              --output text
-          )
-
-          echo "runner_subnet_id=${runner_subnet_id}" >> "$GITHUB_OUTPUT"
-          echo "runner_security_group_id=${runner_security_group_id}" >> "$GITHUB_OUTPUT"
-          echo "runner_instance_profile_name=${runner_instance_profile_name}" >> "$GITHUB_OUTPUT"
-          echo "services_ec2_instance_id=${services_ec2_instance_id}" >> "$GITHUB_OUTPUT"
-          echo "runner_ami_id=${runner_ami_id}" >> "$GITHUB_OUTPUT"
-
-      - id: start
-        uses: machulav/ec2-github-runner@v2
-        with:
-          mode: start
-          github-token: ${{ secrets.GH_PAT }}
-          ec2-image-id: ${{ steps.resolve.outputs.runner_ami_id }}
-          ec2-instance-type: t3.medium
-          subnet-id: ${{ steps.resolve.outputs.runner_subnet_id }}
-          security-group-id: ${{ steps.resolve.outputs.runner_security_group_id }}
-          iam-role-name: ${{ steps.resolve.outputs.runner_instance_profile_name }}
-          startup-timeout-minutes: 20
-          runner-debug: true
-          pre-runner-script: |
-            set -euo pipefail
-            dnf update -y
-            dnf install -y git jq awscli
-          aws-resource-tags: >
-            [{"Key":"Name","Value":"monorepo-course-runner-${{ github.run_id }}"},
-             {"Key":"Project","Value":"monorepo-course"},
-             {"Key":"Environment","Value":"learn-aws-dev"},
-             {"Key":"WorkflowRun","Value":"${{ github.run_id }}"}]
-
   deploy:
-    needs: start-runner
-    runs-on: ${{ needs.start-runner.outputs.label }}
-    permissions:
-      id-token: write
-      contents: read
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+      REPO_URL: https://github.com/alesiooooooo/monorepo-course.git
+      APP_DIR: /opt/apps/monorepo-course
+      TARGET_ENV: learn-aws-dev
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Roll out on dev EC2 via SSM
-        env:
-          AWS_REGION: ${{ vars.AWS_REGION }}
-          TARGET_INSTANCE_ID: ${{ needs.start-runner.outputs.services_ec2_instance_id }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_SHA: ${{ github.sha }}
-          GH_PAT: ${{ secrets.GH_PAT }}
+      - name: Resolve target EC2
+        id: target
         run: |
           set -euo pipefail
 
-          command_id=$(aws ssm send-command \
-            --region "${AWS_REGION}" \
-            --document-name "AWS-RunShellScript" \
-            --comment "monorepo-course deploy ${GITHUB_SHA}" \
-            --timeout-seconds 7200 \
-            --instance-ids "${TARGET_INSTANCE_ID}" \
-            --parameters "commands=$(jq -cn --arg repo "${GITHUB_REPOSITORY}" --arg sha "${GITHUB_SHA}" --arg pat "${GH_PAT}" '[
-              \"set -euo pipefail\",
-              \"sudo mkdir -p /opt/apps\",
-              \"sudo chown -R ec2-user:ec2-user /opt/apps\",
-              \"git config --system --add safe.directory /opt/apps/monorepo-course\",
-              \"if [ ! -d /opt/apps/monorepo-course/.git ]; then rm -rf /opt/apps/monorepo-course; git clone --depth 1 --branch master https://x-access-token:\($pat)@github.com/\($repo).git /opt/apps/monorepo-course; fi\",
-              \"cd /opt/apps/monorepo-course\",
-              \"git remote set-url origin https://x-access-token:\($pat)@github.com/\($repo).git\",
-              \"git fetch --depth 1 origin \($sha)\",
-              \"git checkout --force \($sha)\",
-              \"sudo -u ec2-user bash -lc \\\"cd /opt/apps/monorepo-course && npm install && npm run build && bash deploy/scripts/sync-env.sh /opt/apps/monorepo-course/deploy learn-aws-dev && bash deploy/scripts/render-env.sh /opt/apps/monorepo-course/deploy && bash deploy/scripts/run-migrations.sh /opt/apps/monorepo-course/deploy learn-aws-dev && pm2 startOrReload deploy/ecosystem.config.js --update-env && pm2 restart auth-service orders-service payments-service --update-env && pm2 save\\\"\",
-              \"curl --fail --silent --show-error http://127.0.0.1:3001/login >/dev/null\",
-              \"curl --fail --silent --show-error -X POST http://127.0.0.1:3002/orders -H \\\"Content-Type: application/json\\\" -d \\\"{}\\\" >/dev/null\",
-              \"curl --fail --silent --show-error http://127.0.0.1:3003/pay >/dev/null\"
-            ]')" \
-            --query "Command.CommandId" \
-            --output text)
+          INSTANCE_ID="$(
+            aws ec2 describe-instances \
+              --region "$AWS_REGION" \
+              --filters \
+                "Name=tag:Project,Values=monorepo-course" \
+                "Name=tag:Environment,Values=learn-aws-dev" \
+                "Name=instance-state-name,Values=running" \
+              --query 'Reservations[].Instances[].InstanceId' \
+              --output text
+          )"
 
-          echo "SSM command id: ${command_id}"
-
-          status="Pending"
-          max_wait_seconds=3600
-          poll_interval_seconds=15
-          waited_seconds=0
-          while [ "${waited_seconds}" -lt "${max_wait_seconds}" ]; do
-            status=$(aws ssm get-command-invocation \
-              --region "${AWS_REGION}" \
-              --command-id "${command_id}" \
-              --instance-id "${TARGET_INSTANCE_ID}" \
-              --query "Status" \
-              --output text 2>/dev/null || echo "Pending")
-            echo "SSM status: ${status} (elapsed ${waited_seconds}s)"
-            case "${status}" in
-              Success|Cancelled|TimedOut|Failed|Cancelling)
-                break
-                ;;
-            esac
-            sleep "${poll_interval_seconds}"
-            waited_seconds=$((waited_seconds + poll_interval_seconds))
-          done
-
-          echo "SSM status: ${status}"
-          aws ssm get-command-invocation \
-            --region "${AWS_REGION}" \
-            --command-id "${command_id}" \
-            --instance-id "${TARGET_INSTANCE_ID}" \
-            --query "StandardOutputContent" \
-            --output text || true
-          aws ssm get-command-invocation \
-            --region "${AWS_REGION}" \
-            --command-id "${command_id}" \
-            --instance-id "${TARGET_INSTANCE_ID}" \
-            --query "StandardErrorContent" \
-            --output text || true
-
-          if [ "${status}" != "Success" ]; then
-            echo "SSM rollout failed with status ${status}" >&2
+          if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "None" ]; then
+            echo "No running dev instance found"
             exit 1
           fi
 
-  stop-runner:
-    needs: [start-runner, deploy]
-    runs-on: ubuntu-latest
-    if: ${{ always() && needs.start-runner.outputs.ec2_instance_id != '' }}
-    permissions:
-      id-token: write
-      contents: read
-    steps:
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
+          if printf '%s' "$INSTANCE_ID" | grep -q '[[:space:]]'; then
+            echo "Expected exactly one dev instance, got: $INSTANCE_ID"
+            exit 1
+          fi
 
-      - uses: machulav/ec2-github-runner@v2
-        with:
-          mode: stop
-          github-token: ${{ secrets.GH_PAT }}
-          label: ${{ needs.start-runner.outputs.label }}
-          ec2-instance-id: ${{ needs.start-runner.outputs.ec2_instance_id }}
+          echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Send deploy command
+        id: send
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          INSTANCE_ID: ${{ steps.target.outputs.instance_id }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${GH_PAT:-}" ]; then
+            CLONE_URL="https://x-access-token:${GH_PAT}@github.com/alesiooooooo/monorepo-course.git"
+          else
+            CLONE_URL="$REPO_URL"
+          fi
+
+          cat > /tmp/ssm-commands.json <<EOF
+          {
+            "commands": [
+              "set -euo pipefail",
+              "mkdir -p /opt/apps",
+              "if [ ! -d '$APP_DIR/.git' ]; then rm -rf '$APP_DIR' && git clone '$CLONE_URL' '$APP_DIR'; fi",
+              "cd '$APP_DIR'",
+              "git remote set-url origin '$CLONE_URL'",
+              "git fetch --prune origin",
+              "git reset --hard '$GITHUB_SHA'",
+              "chown -R ec2-user:ec2-user '$APP_DIR'",
+              "runuser -l ec2-user -c 'cd $APP_DIR && npm install'",
+              "runuser -l ec2-user -c 'cd $APP_DIR && npm run build'",
+              "runuser -l ec2-user -c 'cd $APP_DIR && AWS_REGION=$AWS_REGION bash deploy/scripts/sync-env.sh $APP_DIR/deploy $TARGET_ENV'",
+              "runuser -l ec2-user -c 'cd $APP_DIR && bash deploy/scripts/render-env.sh $APP_DIR/deploy'",
+              "runuser -l ec2-user -c 'cd $APP_DIR && bash deploy/scripts/run-migrations.sh $APP_DIR/deploy $TARGET_ENV'",
+              "runuser -l ec2-user -c 'cd $APP_DIR && pm2 startOrReload deploy/ecosystem.config.js --update-env'",
+              "runuser -l ec2-user -c 'pm2 restart auth-service orders-service payments-service --update-env'",
+              "runuser -l ec2-user -c 'pm2 save'",
+              "curl --fail --silent http://127.0.0.1:3001/login >/dev/null",
+              "curl --fail --silent -X POST http://127.0.0.1:3002/orders -H \\\"Content-Type: application/json\\\" -d \\\"{}\\\" >/dev/null",
+              "curl --fail --silent http://127.0.0.1:3003/pay >/dev/null"
+            ]
+          }
+          EOF
+
+          COMMAND_ID="$(
+            aws ssm send-command \
+              --region "$AWS_REGION" \
+              --instance-ids "$INSTANCE_ID" \
+              --document-name "AWS-RunShellScript" \
+              --comment "Deploy monorepo-course ${GITHUB_SHA}" \
+              --parameters file:///tmp/ssm-commands.json \
+              --query 'Command.CommandId' \
+              --output text
+          )"
+
+          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for deploy result
+        env:
+          INSTANCE_ID: ${{ steps.target.outputs.instance_id }}
+          COMMAND_ID: ${{ steps.send.outputs.command_id }}
+        run: |
+          set -euo pipefail
+
+          while true; do
+            STATUS="$(
+              aws ssm get-command-invocation \
+                --region "$AWS_REGION" \
+                --command-id "$COMMAND_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --query 'Status' \
+                --output text
+            )"
+
+            echo "SSM status: $STATUS"
+
+            case "$STATUS" in
+              Success)
+                aws ssm get-command-invocation \
+                  --region "$AWS_REGION" \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$INSTANCE_ID" \
+                  --query 'StandardOutputContent' \
+                  --output text
+                break
+                ;;
+              Cancelled|Cancelling|Failed|TimedOut)
+                echo "Deploy failed with status: $STATUS"
+                echo "--- stdout ---"
+                aws ssm get-command-invocation \
+                  --region "$AWS_REGION" \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$INSTANCE_ID" \
+                  --query 'StandardOutputContent' \
+                  --output text
+                echo "--- stderr ---"
+                aws ssm get-command-invocation \
+                  --region "$AWS_REGION" \
+                  --command-id "$COMMAND_ID" \
+                  --instance-id "$INSTANCE_ID" \
+                  --query 'StandardErrorContent' \
+                  --output text
+                exit 1
+                ;;
+            esac
+
+            sleep 10
+          done

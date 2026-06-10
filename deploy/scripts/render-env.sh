@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
+
 set -euo pipefail
 
-ROOT_DIR="${1:-$(pwd)}"
+DEPLOY_DIR="${1:?deploy dir is required}"
 
-for service in auth orders payments; do
-  file="${ROOT_DIR}/.env.${service}"
-  if [ ! -f "${file}" ]; then
-    echo "Missing env file ${file}" >&2
+for file in "$DEPLOY_DIR/.env.auth" "$DEPLOY_DIR/.env.orders" "$DEPLOY_DIR/.env.payments"; do
+  if [ ! -f "$file" ]; then
+    echo "Missing env file: $file" >&2
     exit 1
   fi
-  chmod 600 "${file}"
-done
 
-echo "Environment files are ready in ${ROOT_DIR}"
+  chmod 600 "$file"
+done

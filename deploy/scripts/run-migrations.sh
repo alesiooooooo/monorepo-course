@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
+
 set -euo pipefail
 
-ROOT_DIR="${1:-$(pwd)}"
-ENVIRONMENT="${2:-learn-aws-dev}"
+DEPLOY_DIR="${1:?deploy dir is required}"
+TARGET_ENV="${2:?target env is required}"
 
-echo "No database migrations configured for ${ENVIRONMENT}. Skipping."
-echo "Deploy root: ${ROOT_DIR}"
+echo "No migrations configured for $TARGET_ENV"
